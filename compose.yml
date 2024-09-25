@@ -9,6 +9,8 @@ services:
     depends_on:
       - postgres
       - redis
+    volumes:
+      - ./:/app # bind mount current dir for development
 
   postgres:
     container_name: connect-postgresql
