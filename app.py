@@ -55,8 +55,9 @@ RATE_LIMIT_WINDOW = 60
 app = Flask(__name__)
 app.config.from_object(Config)
 app.config['JWT_SECRET_KEY'] = 'your-secret-key'  # Change this to your secret key
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(seconds=20)
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=1)
 CORS(app)
+
 
 socketio = SocketIO(app, message_queue="redis://localhost:6379/0", cors_allowed_origins="*")
 redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
@@ -75,10 +76,10 @@ def rate_limit(limit: int, window: int):
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            username = request.json.get("username", None)
-            if not username:
-                return jsonify({"msg": "Username is required for rate limiting"}), 400
-            rate_limit_key = USER_AUTH_RATE_LIMIT_PREFIX + username
+            email = request.json.get("email", None)
+            if not email:
+                return jsonify({"msg": "Email is required for rate limiting"}), 400
+            rate_limit_key = USER_AUTH_RATE_LIMIT_PREFIX + email
             current_count = redis_client.incr(rate_limit_key)
             if current_count == 1:
                 redis_client.expire(rate_limit_key, window)
@@ -117,29 +118,108 @@ def register():
 @app.route('/login', methods=['POST'])
 @rate_limit(AUTH_LIMIT, RATE_LIMIT_WINDOW)
 def login():
-    username = request.json.get("username", None)
+    email = request.json.get("email", None)
     password = request.json.get("password", None)
-
-    if username and password:
+    if email and password:
         try:
-            cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
+            cursor.execute("SELECT id, username, email, password, status FROM users WHERE email = %s", (email,))
             result = cursor.fetchone()
-            if result and bcrypt.checkpw(password.encode('utf-8'), result[0].encode('utf-8')):
-                access_token = create_access_token(identity=username)
+            if result and bcrypt.checkpw(password.encode('utf-8'), result[3].encode('utf-8')):
+                user_data = {
+                    "id": result[0],         # User ID
+                    "username": result[1],    # Username
+                    "email": result[2],       # Email
+                    "status": result[4]       # User status
+                }
+                print(user_data)
+                access_token = create_access_token(identity=user_data)
                 return jsonify(access_token=access_token), 200
             else:
                 return jsonify({"msg": "Bad username or password"}), 401
-
         except psycopg2.Error as e:
             return jsonify({"msg": "Database error", "error": str(e)}), 500
     return jsonify({"msg": "Missing username or password"}), 400
 
 
-@app.route('/protected', methods=['GET'])
+@app.route('/users', methods=['GET'])
 @jwt_required()
-def protected():
-    current_user = get_jwt_identity()
-    return jsonify(logged_in_as=current_user), 200
+def get_users():
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+    users_list = [
+        {
+            'id': user[0],
+            'username': user[1],
+            'email': user[2],
+            'status': user[4]
+        }
+        for user in users
+    ]
+    return jsonify(users=users_list), 200
+
+
+@app.route('/conversations', methods=['GET'])
+@jwt_required()
+def get_conversations():
+    cursor.execute("SELECT * FROM conversations")
+    convos = cursor.fetchall()
+    convos_list = [
+        {
+            'id': convo[0],
+            'room_name': convo[1],
+            'created_by': convo[2],
+            'participant': convo[3],
+            'created_at': convo[4]
+        }
+        for convo in convos
+    ]
+    return jsonify(conversations=convos_list), 200
+
+
+@app.route('/conversations/<room_name>', methods=['POST'])
+@jwt_required()
+def check_room_exists(room_name):
+    sub = get_jwt_identity()
+    created_by = sub['id']
+    participant = request.json.get('participant')
+
+    try:
+        check_query = f'''
+            SELECT id, room_name, created_by, participant, created_at FROM conversations WHERE room_name = %s;
+        '''
+        with conn.cursor() as cursor:
+            cursor.execute(check_query, (room_name,))
+            existing_conversation = cursor.fetchone()
+        if existing_conversation:
+            return jsonify({
+                    "id": existing_conversation[0],
+                    "room_name": existing_conversation[1],
+                    "created_by": existing_conversation[2],
+                    "participant": existing_conversation[3],
+                    "created_at": existing_conversation[4],
+                }), 200
+        else:
+            insert_query = f'''
+                INSERT INTO conversations (room_name, created_by, participant) 
+                VALUES (%s, %s, %s) RETURNING id, room_name, created_by, participant, created_at;
+            '''
+            with conn.cursor() as cursor:
+                cursor.execute(insert_query, (room_name, created_by, participant))
+                conn.commit()
+                conversation_id, room_name, created_by, participant, created_at = cursor.fetchone()
+                print(f"Created new conversation: {room_name} by user ID {created_by}")
+                return jsonify({
+                    "id": conversation_id,
+                    "room_name": room_name,
+                    "created_by": created_by,
+                    "participant": participant,
+                    "created_at": created_at,
+                }), 201
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        conn.rollback()
+        return jsonify({"message": f"An error occurred: {e}"}), 500
 
 
 @jwt.expired_token_loader
@@ -150,12 +230,11 @@ def expired_token_callback(jwt_header, jwt_payload):
 # Join a room (start a chat)
 @socketio.on(SOCKET_EVENTS['JOIN_ROOM'])
 def handle_join_room(data):
-    room = data['room']
-    username = data['username']
-    join_room(room)
-    socketio.emit(SOCKET_EVENTS['USER_JOINED'], {'username': username, 'room': room}, room=room, include_self=False)
-    enter_room.delay(username, room)
-
+    room_name = data['room']
+    created_by = data['created_by']
+    username = data['username']  # For broadcast to another user
+    join_room(room_name)
+    socketio.emit(SOCKET_EVENTS['USER_JOINED'], {'username': username, 'room': room_name}, room=room_name)
 
 # Leave a room (del a chat or manually leave)
 @socketio.on(SOCKET_EVENTS['LEAVE_ROOM'])
@@ -164,7 +243,7 @@ def handle_leave_room(data):
     username = data['username']
     leave_room(room)
     socketio.emit(SOCKET_EVENTS['USER_LEFT'], {'username': username}, room=room, include_self=False)
-    leave_chat.delay(username, room)
+    # leave_chat.delay(username, room)
 
 
 # Sending messages
@@ -178,7 +257,7 @@ def handle_send_message(data):
         'timestamp': str(datetime.now())
     }
     redis_client.publish(REDIS_CHANNELS['CHAT_MESSAGES'], json.dumps(message))
-    store_message.delay(message['room'], message['sender'], message['content'], message['timestamp'])
+    # store_message.delay(message['room'], message['sender'], message['content'], message['timestamp'])
 
 
 # Editing messages
@@ -193,7 +272,7 @@ def handle_edit_message(data):
         'edited_at': str(datetime.now())
     }
     redis_client.publish(REDIS_CHANNELS['EDIT_MESSAGES'], json.dumps(message))
-    update_message.delay(message['message_id'], message['new_content'], message['edited_at'])
+    # update_message.delay(message['message_id'], message['new_content'], message['edited_at'])
 
 
 # Deleting messages
@@ -204,7 +283,7 @@ def handle_delete_message(data):
         'message_id': data['message_id']
     }
     redis_client.publish(REDIS_CHANNELS['DELETE_MESSAGES'], json.dumps(message))
-    delete_message.delay(message['message_id'])
+    # delete_message.delay(message['message_id'])
 
 
 # Typing animation
