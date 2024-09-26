@@ -6,6 +6,8 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from datetime import datetime, timedelta
 from config import Config
 
+from worker import store_message, enter_room, leave_chat, update_message, delete_message, update_active_status
+
 import json
 import redis
 import psycopg2
@@ -19,20 +21,21 @@ SOCKET_EVENTS = {
     'EDIT_MESSAGE': 'edit_message',
     'DELETE_MESSAGE': 'delete_message',
     'TYPING': 'typing',
+    'STOP_TYPING': 'stop_typing',
     'RECEIVE_MESSAGE': 'receive_message',
     'MESSAGE_EDITED': 'message_edited',
     'MESSAGE_DELETED': 'message_deleted',
-    'USER_TYPING': 'user_typing',
+    'active_TYPING': 'user_typing',
     'USER_JOINED': 'user_joined',
     'USER_LEFT': 'user_left',
     'ACTIVE_STATUS': 'active_status',
 }
 
 REDIS_CHANNELS = {
-    'CHAT_MESSAGES': 'chat_messages',
-    'EDIT_MESSAGES': 'edit_messages',
-    'DELETE_MESSAGES': 'delete_messages',
-    'ACTIVE_USERS': 'active_users'
+    'CHAT_MESSAGES': 'channel:chat_messages',
+    'EDIT_MESSAGES': 'channel:edit_messages',
+    'DELETE_MESSAGES': 'channel:delete_messages',
+    'ACTIVE_USERS': 'channel:active_users'
 }
 
 DATABASE_CONFIG = {
@@ -43,8 +46,8 @@ DATABASE_CONFIG = {
     'port': '5432'
 }
 
-USER_AUTH_RATE_LIMIT_PREFIX = "rate_limit_auth:"
-USER_CHAT_RATE_LIMIT_PREFIX = "rate_limit_chat:"
+USER_AUTH_RATE_LIMIT_PREFIX = "rate_limit:auth:"
+USER_CHAT_RATE_LIMIT_PREFIX = "rate_limit:chat:"
 AUTH_LIMIT = 10
 CHAT_LIMIT = 5
 RATE_LIMIT_WINDOW = 60
@@ -110,6 +113,7 @@ def register():
         conn.rollback()
         return jsonify({"msg": "Database error", "error": str(e)}), 500
 
+
 @app.route('/login', methods=['POST'])
 @rate_limit(AUTH_LIMIT, RATE_LIMIT_WINDOW)
 def login():
@@ -130,15 +134,18 @@ def login():
             return jsonify({"msg": "Database error", "error": str(e)}), 500
     return jsonify({"msg": "Missing username or password"}), 400
 
+
 @app.route('/protected', methods=['GET'])
 @jwt_required()
 def protected():
     current_user = get_jwt_identity()
     return jsonify(logged_in_as=current_user), 200
 
+
 @jwt.expired_token_loader
 def expired_token_callback(jwt_header, jwt_payload):
     return jsonify({"msg": "The token has expired", "error": "token_expired"}), 401
+
 
 # Join a room (start a chat)
 @socketio.on(SOCKET_EVENTS['JOIN_ROOM'])
@@ -147,6 +154,7 @@ def handle_join_room(data):
     username = data['username']
     join_room(room)
     socketio.emit(SOCKET_EVENTS['USER_JOINED'], {'username': username, 'room': room}, room=room, include_self=False)
+    enter_room.delay(username, room)
 
 
 # Leave a room (del a chat or manually leave)
@@ -156,6 +164,7 @@ def handle_leave_room(data):
     username = data['username']
     leave_room(room)
     socketio.emit(SOCKET_EVENTS['USER_LEFT'], {'username': username}, room=room, include_self=False)
+    leave_chat.delay(username, room)
 
 
 # Sending messages
@@ -169,13 +178,13 @@ def handle_send_message(data):
         'timestamp': str(datetime.now())
     }
     redis_client.publish(REDIS_CHANNELS['CHAT_MESSAGES'], json.dumps(message))
-    # persist_message.delay(message['room'], message['sender'], message['content'], message['timestamp'])
+    store_message.delay(message['room'], message['sender'], message['content'], message['timestamp'])
 
 
 # Editing messages
 @socketio.on(SOCKET_EVENTS['EDIT_MESSAGE'])
 def handle_edit_message(data):
-    edited_message = {
+    message = {
         'sid': data['sid'],
         'message_id': data['message_id'],
         'room': data['room'],
@@ -183,24 +192,35 @@ def handle_edit_message(data):
         'new_content': data['new_content'],
         'edited_at': str(datetime.now())
     }
-    redis_client.publish(REDIS_CHANNELS['EDIT_MESSAGES'], json.dumps(edited_message))
+    redis_client.publish(REDIS_CHANNELS['EDIT_MESSAGES'], json.dumps(message))
+    update_message.delay(message['message_id'], message['new_content'], message['edited_at'])
 
 
 # Deleting messages
 @socketio.on(SOCKET_EVENTS['DELETE_MESSAGE'])
 def handle_delete_message(data):
-    deleted_message = {
+    message = {
         'room': data['room'],
         'message_id': data['message_id']
     }
-    redis_client.publish(REDIS_CHANNELS['DELETE_MESSAGES'], json.dumps(deleted_message))
+    redis_client.publish(REDIS_CHANNELS['DELETE_MESSAGES'], json.dumps(message))
+    delete_message.delay(message['message_id'])
 
 
 # Typing animation
 @socketio.on(SOCKET_EVENTS['TYPING'])
 def handle_typing(data):
     room = data['room']
-    socketio.emit(SOCKET_EVENTS['USER_TYPING'], {'user': data['user']}, room=room)
+    user = data['user']
+    socketio.emit(SOCKET_EVENTS['USER_TYPING'], {'user': user, 'typing': True}, room=room)
+
+# Stop typing animation
+@socketio.on(SOCKET_EVENTS['STOP_TYPING'])
+def handle_stop_typing(data):
+    room = data['room']
+    user = data['user']
+    socketio.emit(SOCKET_EVENTS['USER_TYPING'], {'user': user, 'typing': False}, room=room)
+
 
 # Active Status
 @socketio.on(SOCKET_EVENTS['ACTIVE_STATUS'])
@@ -208,6 +228,7 @@ def handle_active_status(data):
     user_id = data['user_id']
     status = data['status']  # 'online', 'offline', or 'last_seen'
     redis_client.hset(REDIS_CHANNELS['ACTIVE_USERS'], user_id, status)
+    update_active_status.delay(user_id, status)
     socketio.emit(SOCKET_EVENTS['ACTIVE_STATUS'], {'user_id': user_id, 'status': status})
 
 

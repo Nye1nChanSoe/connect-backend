@@ -1,4 +1,4 @@
--- User table
+-- User table [DONE in register]
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(255) UNIQUE NOT NULL,
@@ -8,26 +8,26 @@ CREATE TABLE users (
 );
 
 -- Room table
-CREATE TABLE rooms (
+CREATE TABLE rooms  (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255), -- nullable for one-to-one chats
     is_group BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Message table
+-- Message table [DONE in send_message]
 CREATE TABLE messages (
     id SERIAL PRIMARY KEY,
-    room_id INT REFERENCES rooms(id) ON DELETE CASCADE,
+    room_id INT REFERENCES rooms(id) ON DELETE CASCADE,        -- nullable for one on one chats
     sender_id INT REFERENCES users(id) ON DELETE SET NULL,
     receiver_id INT REFERENCES users(id) ON DELETE SET NULL,   -- nullable for group chats
     content TEXT NOT NULL,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     edited_at TIMESTAMP, -- nullable, to store edit time if message was edited
-    deleted BOOLEAN DEFAULT FALSE -- soft delete flag
+    deleted BOOLEAN DEFAULT FALSE
 );
 
--- RoomMembers table (for tracking which users are in which rooms)
+-- RoomMembers table (for tracking which users are in which rooms) [DONE]
 CREATE TABLE room_members (
     room_id INT REFERENCES rooms(id) ON DELETE CASCADE,
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
