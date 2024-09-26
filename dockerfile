@@ -16,4 +16,5 @@ COPY . .
 
 EXPOSE 5000
 
-CMD [ "python3", "app.py" ]
+# CMD [ "python3", "app.py" ]
+CMD ["sh", "-c", "python3 app.py & celery -A celery_worker.celery worker --loglevel=info"]
