@@ -6,7 +6,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from datetime import datetime, timedelta
 from config import Config
 
-from worker import store_message, enter_room, leave_chat, update_message, delete_message, update_active_status
+from worker import store_message
 
 import json
 import redis
@@ -182,7 +182,6 @@ def check_room_exists(room_name):
     sub = get_jwt_identity()
     created_by = sub['id']
     participant = request.json.get('participant')
-
     try:
         check_query = f'''
             SELECT id, room_name, created_by, participant, created_at FROM conversations WHERE room_name = %s;
@@ -215,7 +214,6 @@ def check_room_exists(room_name):
                     "participant": participant,
                     "created_at": created_at,
                 }), 201
-
     except Exception as e:
         print(f"An error occurred: {e}")
         conn.rollback()
@@ -246,18 +244,22 @@ def handle_leave_room(data):
     # leave_chat.delay(username, room)
 
 
-# Sending messages
+# Send message
 @socketio.on(SOCKET_EVENTS['SEND_MESSAGE'])
 def handle_send_message(data):
     message = {
-        'sid': data['sid'],
-        'room': data['room'],
-        'sender': data['sender'],
+        'conversation_id': data['conversation_id'],
+        'sender_id': data['sender_id'],
         'content': data['content'],
         'timestamp': str(datetime.now())
     }
     redis_client.publish(REDIS_CHANNELS['CHAT_MESSAGES'], json.dumps(message))
-    # store_message.delay(message['room'], message['sender'], message['content'], message['timestamp'])
+    store_message.delay(
+        message['conversation_id'], 
+        message['sender_id'], 
+        message['content'], 
+        message['timestamp']
+    )
 
 
 # Editing messages

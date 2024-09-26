@@ -6,80 +6,21 @@ from datetime import datetime
 # Create a Celery instance
 celery = Celery(__name__, broker='redis://localhost:6379/0')
 
+# TODO: open connection at the start of the script
 
-# Store chat message
 @celery.task
-def store_message(room, sender, content, timestamp):
-    # Run the async function in the event loop
+def store_message(conversation_id, sender_id, content, timestamp):
     if isinstance(timestamp, str):
         timestamp = datetime.fromisoformat(timestamp)
-    asyncio.run(async_persist_message(room, sender, content, timestamp))
+    asyncio.run(async_persist_message(conversation_id, sender_id, content, timestamp))
 
-async def async_persist_message(room, sender, content, timestamp):
-    # TODO: open connection at the start of the script
+async def async_persist_message(conversation_id, sender_id, content, timestamp):
     conn = await asyncpg.connect(user='admin', password='password', database='connect', host='localhost')
     await conn.execute(
-        "INSERT INTO messages (room, sender, content, timestamp) VALUES ($1, $2, $3, $4)",
-        room, sender, content, timestamp
+        "INSERT INTO messages (conversation_id, sender_id, content, timestamp) VALUES ($1, $2, $3, $4)",
+        conversation_id, sender_id, content, timestamp
     )
     await conn.close()
-
-
-# Store room member
-@celery.task
-def enter_room(username, room):
-    asyncio.run(async_persist_enter_room(username, room))
-
-async def async_persist_enter_room(username, room):
-    conn = await asyncpg.connect(user='admin', password='password', database='connect', host='localhost')
-    # Step 1: Check if the room exists
-    room_id = await conn.fetchval("SELECT id FROM rooms WHERE name = $1", room)
-    # Step 2: If the room doesn't exist, create it and get the room ID
-    if room_id is None:
-        room_id = await conn.fetchval(
-            "INSERT INTO rooms (name) VALUES ($1) RETURNING id",
-            room
-        )
-    # Step 3: Check if the user is already in the room
-    existing_member = await conn.fetchval(
-        "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = (SELECT id FROM users WHERE username = $2)",
-        room_id, username
-    )
-    if existing_member:
-        await conn.close()
-        return
-    # Step 4: Add the new member to the room
-    await conn.execute(
-        "INSERT INTO room_members (room_id, user_id) VALUES ($1, (SELECT id FROM users WHERE username = $2))",
-        room_id, username
-    )
-    # Step 5: Check the room member count
-    member_count = await conn.fetchval(
-        "SELECT COUNT(*) FROM room_members WHERE room_id = $1",
-        room_id
-    )
-    # Step 6: If there are more than 2 members, set the room as a group chat
-    if member_count > 2:
-        await conn.execute(
-            "UPDATE rooms SET is_group = TRUE WHERE id = $1",
-            room_id
-        )
-    await conn.close()
-
-
-# Delete room member
-@celery.task
-def leave_chat(username, room):
-    asyncio.run(async_persist_leave_room(username, room))
-
-async def async_persist_leave_room(username, room):
-    conn = await asyncpg.connect(user='admin', password='password', database='connect', host='localhost')
-    await conn.execute(
-        "DELETE FROM room_members WHERE room_id = (SELECT id FROM rooms WHERE name = $1) AND user_id = (SELECT id FROM users WHERE username = $2)",
-        room, username
-    )
-    await conn.close()
-
 
 # Update message
 def update_message(message_id, new_content, edited_at):
